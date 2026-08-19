@@ -1,0 +1,17 @@
+[package]
+name = "tnldpc"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies, deliberately: this must build on a checkout with no network
+# and no registry cache.  Everything it needs is in std.
+
+[[bin]]
+name = "tnldpc"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

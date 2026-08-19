@@ -6,6 +6,7 @@ import hashlib
 from tqdm import trange
 from pathlib import Path
 from tool import load_bin
+from functools import cache
 
 STATUS_NAMES = (
     'STATUS_FAILURE',
@@ -170,6 +171,10 @@ class Reg:
     ACTLR = 5
     VBAR = 6
     CPSR = 7
+    BTCMREGION = 8
+    ATCMREGION = 9
+    TCMSELECTION = 10
+    MPIDR = 11
 
 class Client:
     CMD_PING = 0
@@ -179,25 +184,47 @@ class Client:
     CMD_INT_DISABLE = 4
     CMD_INT_ENABLE = 5
     CMD_DABORT_STATUS = 6
+    CMD_CP15_ACCESS = 7
+    CMD_CORE_N_CMD = 8
+    CMD_CALL = 9
+    CMD_MEM_FILL = 12
+    CMD_IRQ_TEST = 14
+    CMD_CRC16 = 15
+    CMD_MMIO_DRAIN = 16
+    CMD_GBE_START = 17
+    CMD_NAND_READ_PAGES = 18
+    CMD_NAND_START = 19
+    CMD_NAND_WAIT = 20
+    CMD_NAND_STREAM = 21
 
     def __init__(self, port, baudrate=230400*2):
-        self.port = serial.Serial(port, baudrate=baudrate, timeout=1)
+        # A port name, or any object with the pyserial methods used here.
+        # titania_gbe.GbePort is the latter, carrying the same bytes over
+        # Ethernet.
+        if isinstance(port, str):
+            self.port = serial.Serial(port, baudrate=baudrate, timeout=1)
+        else:
+            self.port = port
 
-    def __del__(self):
-        self.port.close()
+    def open(self):
+        if self.port.is_open:
+            self.port.close()
+        self.port.open()
 
     def _read_fmt(self, fmt):
         size = struct.calcsize(fmt)
         data = self.port.read(size)
+        #print('<', data.hex())
         vals = struct.unpack(fmt, data)
         return vals[0] if len(vals) == 1 else vals
 
-    def _write_fmt(self, fmt, val):
-        self.port.write(struct.pack(fmt, val))
+    def _write_fmt(self, fmt, *val):
+        #hexdump(struct.pack(fmt, val))
+        self.port.write(struct.pack(fmt, *val))
 
-    def _read8(self): return self._read_fmt('<B')
-    def _read16(self): return self._read_fmt('<H')
-    def _read32(self): return self._read_fmt('<I')
+    def _read8(self) -> int: return self._read_fmt('<B')
+    def _read16(self) -> int: return self._read_fmt('<H')
+    def _read32(self) -> int: return self._read_fmt('<I')
     def _write8(self, val): self._write_fmt('<B', val)
     def _write16(self, val): self._write_fmt('<H', val)
     def _write32(self, val): self._write_fmt('<I', val)
@@ -209,16 +236,17 @@ class Client:
         return self._read32() == magic + 1
 
     def _write_mem_access(self, addr, count, stride, is_write):
-        data = struct.pack('<2I2B', addr, count, stride, is_write)
+        opt = (1 if is_write else 0) << 31 | stride
+        data = struct.pack('<3I', addr, count, opt)
         self._write32(self.CMD_MEM_ACCESS)
         self.port.write(data)
 
-    def reg_read(self, reg: Reg):
+    def reg_read(self, reg: int):
         self._write32(self.CMD_REG_READ)
         self._write8(reg)
         return self._read32()
 
-    def reg_write(self, reg: Reg, val):
+    def reg_write(self, reg: int, val):
         self._write32(self.CMD_REG_WRITE)
         self._write8(reg)
         self._write32(val)
@@ -231,16 +259,17 @@ class Client:
 
     def dabort_status(self):
         self._write32(self.CMD_DABORT_STATUS)
-        addr, status = self._read_fmt('<II')
-        if addr == 0xffffffff and status == 0xffffffff: return None
-        return addr, status
+        iaddr, daddr, status = self._read_fmt('<III')
+        if all(map(lambda x: x == 0xffffffff, (iaddr, daddr, status))): return None
+        return iaddr, daddr, status
 
     def check_dabort(self):
         dabort = self.dabort_status()
         if dabort is None:
-            return
-        dfar = dabort[0]
-        dfsr = dabort[1]
+            return False
+        insn = dabort[0]
+        dfar = dabort[1]
+        dfsr = dabort[2]
         access = 'w' if (dfsr >> 11) & 1 else 'r'
         src = ((dfsr >> 6) & 0x10) | (dfsr & 0xf)
         src_name = {
@@ -253,7 +282,155 @@ class Client:
             0b10110: 'async ext',
             0b11000: 'async parity',
         }.get(src, 'unknown')
-        print(f'DABORT {dfar:08x} {dfsr:08x} {access} {src_name}')
+        print(f'DABORT {dfar:08x} {dfsr:08x} {access} {src_name} {insn:08x}')
+        return True
+
+    UNDEF_SENTINEL = 0xDEADDEAD
+
+    def cp15_read(self, op1, crn, crm, op2, cpnum=15):
+        cp = 0 if cpnum == 15 else cpnum
+        params = (op1 & 7) | ((crn & 0xF) << 3) | ((crm & 0xF) << 7) | ((op2 & 7) << 11) | ((cp & 0xF) << 15)
+        self._write32(self.CMD_CP15_ACCESS)
+        self._write32(params)
+        return self._read32()
+
+    def cp15_write(self, op1, crn, crm, op2, val, cpnum=15):
+        cp = 0 if cpnum == 15 else cpnum
+        params = (op1 & 7) | ((crn & 0xF) << 3) | ((crm & 0xF) << 7) | ((op2 & 7) << 11) | (1 << 14) | ((cp & 0xF) << 15)
+        self._write32(self.CMD_CP15_ACCESS)
+        self._write32(params)
+        self._write32(val)
+        return self._read32()
+
+    SCTLR = (0, 1, 0, 0)
+    MPUIR = (0, 0, 0, 4)
+    MPU_IDX = (0, 6, 2, 0)
+    MPU_BASE = (0, 6, 1, 0)
+    MPU_SIZE_EN = (0, 6, 1, 4)
+    MPU_ACCESS = (0, 6, 1, 2)
+
+    def read_insn_set_attrs(self):
+        id_isar = [self.cp15_read(0, 0, 2, i) for i in range(8)]
+        for i, reg in enumerate(id_isar):
+            print(f'ID_ISAR{i} {reg:08x}')
+        return id_isar
+
+    def mpu_num_regions(self):
+        dregion = (self.cp15_read(*self.MPUIR) >> 8) & 0xff
+        return dregion
+
+    def mpu_entry_set(self, idx, base, size_en, access_control):
+        self.cp15_write(*self.MPU_IDX, idx)
+        self.cp15_write(*self.MPU_BASE, base)
+        self.cp15_write(*self.MPU_SIZE_EN, size_en)
+        self.cp15_write(*self.MPU_ACCESS, access_control)
+
+    def mpu_enable(self, enable):
+        sctlr = self.cp15_read(*self.SCTLR)
+        if enable:
+            sctlr |= 1
+        else:
+            sctlr &= ~1
+        self.cp15_write(*self.SCTLR, sctlr)
+
+    def mpu_setup_cpu0(self):
+        # MPU_SIZE_EN and MPU_ACCESS are named backwards: on Cortex-R5 c6,c1,2
+        # is DRSR (size+enable) and c6,c1,4 is DRACR (access control). The
+        # tuple order below is right for the hardware, so leave it alone --
+        # swapping it to match the names hangs mpu_enable().
+        rom_mpu_entries = [
+            (0, 0x1305, 0x3F),              # 0x00000000 : 0x100000000 XN,full access,S,B
+            (0xF0000000, 0x304, 0x37),      # 0xf0000000 : 0x100000000 full access,S
+            (0xE0000000, 0x302, 0x37),      # 0xE0000000 : 0xF0000000 full access,C
+            (0, 0x30C, 0x3D),               # 0x00000000 : 0x80000000 full access,TEX=001,S  (DRAM will land here)
+            (0x10000000, 0x304, 0x35),      # 0x10000000 : 0x18000000 full access,S
+            (0x18000000, 0x304, 0x2F),      # 0x18000000 : 0x19000000 random mem. full access,S
+            (0x19000000, 0x304, 0x31),      # 0x19000000 : 0x1B000000 bcm. full access,S
+            (0x80000000, 0x304, 0x3B),      # 0x80000000 : 0xC0000000 full access,S
+            (0xC0000000, 0x304, 0x39),      # 0xC0000000 : 0xE0000000 full access,S
+            (0, 0x308, 0x2F),               # 0x00000000 : 0x01000000 local tcms. full access,TEX=001
+            (0xFFFE0000, 0x302, 0x21),      # rom. full access,C
+        ]
+        self.mpu_enable(False)
+        for i, rom_entry in enumerate(rom_mpu_entries):
+            self.mpu_entry_set(i, *rom_entry)
+        idx = len(rom_mpu_entries)
+        #self.mpu_entry_set(idx, 0, 0, 0)
+        #idx += 1
+        for i in range(idx, self.mpu_num_regions()):
+            self.mpu_entry_set(i, 0, 0, 0)
+        self.mpu_enable(True)
+        # dummy write to trigger dsb/isb
+        self.cp15_write(*self.MPU_IDX, 0)
+
+    class CoreNCmd:
+        CoprocRead = 1
+        CoprocWrite = 2
+        Memcpy = 3
+        Read32 = 4
+        Write32 = 5
+
+    def core_n_cmd(self, cpu: int, func: int, *args):
+        self._write32(self.CMD_CORE_N_CMD)
+        assert cpu > 0 and func > 0
+        self._write32(cpu)
+        self._write32(func)
+        assert len(args) <= 3
+        for arg in args:
+            self._write32(arg)
+        for _ in range(len(args), 3):
+            self._write32(0)
+        return [self._read32() for _ in range(4)]
+
+    def core_n_coproc_rw(self, cpu: int, op1: int, crn: int, crm: int, op2: int, cmd: int, val: int=0, cpnum: int=15) -> int | None:
+        params = (op2 & 7) << 11 | (crm & 0xF) << 7 | (crn & 0xF) << 3 | op1 & 7 | ((cpnum & 0xF) << 15)
+        rv = self.core_n_cmd(cpu, cmd, params, val)
+        # check undef
+        if rv[1]: return None
+        return rv[2]
+
+    def core_n_coproc_read(self, cpu: int, op1: int, crn: int, crm: int, op2: int, cpnum: int=15) -> int | None:
+        return self.core_n_coproc_rw(cpu, op1, crn, crm, op2, self.CoreNCmd.CoprocRead, cpnum=cpnum)
+
+    def core_n_coproc_write(self, cpu: int, op1: int, crn: int, crm: int, op2: int, val: int, cpnum: int=15) -> int | None:
+        return self.core_n_coproc_rw(cpu, op1, crn, crm, op2, self.CoreNCmd.CoprocWrite, val, cpnum=cpnum)
+
+    def core_n_read32(self, cpu: int, addr: int) -> int:
+        rv = self.core_n_cmd(cpu, self.CoreNCmd.Read32, addr)
+        return rv[1]
+
+    def core_n_write32(self, cpu: int, addr: int, val: int):
+        self.core_n_cmd(cpu, self.CoreNCmd.Write32, addr, val)
+
+    def call(self, func: int, *args, **kwargs) -> int:
+        args = list(args) + [0] * (7 - len(args))
+        assert len(args) == 7
+        self._write32(self.CMD_CALL)
+        self._write32(func)
+        for arg in args:
+            self._write32(arg)
+
+        # XXX some calls will write to uart errlog
+        generates_spew = kwargs.get('generates_spew', False)
+        if generates_spew:
+            waiting = self.port.in_waiting
+            while True:
+                time.sleep(.3)
+                now = self.port.in_waiting
+                if now == waiting:
+                    break
+                waiting = now
+            if waiting > 8:
+                extra = self.port.read(waiting - 8)
+                #print('log:', str(extra, 'ascii'))
+                print('log:')
+                hexdump(extra)
+
+        paborted = self._read32()
+        rv = self._read32()
+        assert paborted in (0, 1)
+        if paborted: raise Exception(f'PABORT calling {func:8x}')
+        return rv
 
     def debug_reset(self):
         self.reg_write(Reg.DBGPRCR, 2)
@@ -308,15 +485,21 @@ class Client:
         for val in vals: self._write_fmt(fmt, val)
         #self.check_dabort()
 
-    def read8(self, addr): return self.read_fmt(addr, '<B')
-    #def read16(self, addr): return self.read_fmt(addr, '<H')
-    def read32(self, addr): return self.read_fmt(addr, '<I')
-    def write8(self, addr, val): self.write_fmt(addr, '<B', val)
-    #def write16(self, addr, val): self.write_fmt(addr, '<H', val)
-    def write32(self, addr, val): self.write_fmt(addr, '<I', val)
+    def read8(self, addr: int) -> int: return self.read_fmt(addr, '<B')
+    def read16(self, addr): return self.read_fmt(addr, '<H')
+    def read32(self, addr: int) -> int: return self.read_fmt(addr, '<I')
+    def write8(self, addr: int, val: int): self.write_fmt(addr, '<B', val)
+    def write16(self, addr, val): self.write_fmt(addr, '<H', val)
+    def write32(self, addr: int, val: int): self.write_fmt(addr, '<I', val)
 
     def read(self, addr, size):
-        self._write_mem_access(addr, size, 1, 0)
+        # Use a 32-bit stride where the range allows it. The target does one
+        # uncached bus read per element, ~3.2 us, so a byte stride costs 13.6 s
+        # for 4 MB and caps throughput around 300 KB/s. Same bytes on the wire.
+        if addr % 4 == 0 and size % 4 == 0:
+            self._write_mem_access(addr, size // 4, 4, 0)
+        else:
+            self._write_mem_access(addr, size, 1, 0)
         data = self.port.read(size)
         assert len(data) == size
         return data
@@ -334,22 +517,25 @@ class Client:
             addr += 1
         return str(bytes(data), 'ascii')
 
-    def wait_server_up(self):
-        while True:
-            self.port.flushInput()
-            self.port.flushOutput()
+    def wait_server_up(self, timeout=1):
+        self.port.reset_output_buffer()
+        start = time.time()
+        while time.time() - start < timeout:
+            self.port.reset_input_buffer()
             try:
-                if self.ping(): break
+                if self.ping(): return True
                 time.sleep(.2)
             except: pass
+        return False
 
+    @cache
     def is_efc(self):
         return self.reg_read(Reg.MIDR) == 0x411fc153
 
     def is_eap(self):
         return not self.is_efc()
 
-    def ipc_jump(self, cpu_index, addr):
+    def _old_ipc_jump(self, cpu_index, addr):
         # TODO might change if sending cpu isn't cpu0?
         ipc_regs = {
             0: 0x14000000,
@@ -389,7 +575,15 @@ class Client:
 
     BCM_BASE = 0x19000000
 
-    def bcm_reg_read32(self, offset):
+    class HashMode:
+        Sha1 = 0
+        Sha224 = 1
+        Sha256 = 2
+        Sha384 = 3
+        Sha512 = 4
+        Md5 = 5
+
+    def bcm_reg_read32(self, offset: int):
         return self.read32(self.BCM_BASE + offset)
 
     def bcm_reg_write32(self, offset, val):
@@ -401,11 +595,11 @@ class Client:
 
     @property
     def bcm_rom_initalized(self):
-        return self.bcm_fifo_status & (1 << 8)
+        return (self.bcm_fifo_status >> 8) & 1
 
     @property
     def bcm_fatal_error(self):
-        return self.bcm_fifo_status & (1 << 10)
+        return (self.bcm_fifo_status >> 10) & 1
 
     @property
     def bcm_host_intp_reg(self):
@@ -417,6 +611,21 @@ class Client:
     @bcm_host_intp_reg.setter
     def bcm_host_intp_reg(self, val):
         self.bcm_reg_write32(0xc8, val)
+
+    @property
+    def bcm_host_address_range_exception(self):
+        return (self.bcm_host_intp_reg >> 16) & 1
+
+    @property
+    def bcm_host_queue_full_access(self):
+        return (self.bcm_host_intp_reg >> 17) & 1
+
+    @property
+    def bcm_host_queue_full(self):
+        return (self.bcm_host_intp_reg >> 18) & 1
+
+    def bcm_read_status(self, idx: int):
+        return self.bcm_reg_read32(0x84 + 4 * idx)
 
     def bcm_dump_regs(self):
         for addr, status in self.read_array_fmt(self.BCM_BASE + 0x80, '<I', 0xe0 - 0x80):
@@ -437,18 +646,18 @@ class Client:
         self.write32(self.BCM_BASE + 0x40, cmd)
 
         # b0 should be set upon completion
-        retries = 0
+        # rom waits up to 100us * 50000 = 5secs
+        start = time.time()
         while (self.bcm_host_intp_reg & 1) == 0:
-            if retries > 200:
+            if time.time() - start > 5:
                 print(f'cmd {cmd:2d} timeout {self.bcm_host_intp_reg:8x}')
                 break
-            retries += 1
 
         #if self.bcm_fifo_status != 0x300:
         #    print('weird fifo status!')
         #    self.bcm_dump_regs()
         return_status = self.read32(self.BCM_BASE + 0x80)
-        '''
+        #'''
         if return_status not in (0,307):
             print(f'cmd {cmd:2d} return_status {return_status} {STATUS_MAP.get(return_status)}')
             if self.bcm_fatal_error:
@@ -459,6 +668,174 @@ class Client:
 
         self.bcm_host_intp_reg = 0xffffffff
         return return_status
+
+    class PortTimeout:
+        def __init__(self, port, timeout):
+            self.port = port
+            self.timeout_saved = None
+            self.temp_timeout = timeout
+        def __enter__(self):
+            self.timeout_saved = self.port.timeout
+            self.port.timeout = self.temp_timeout
+            return None
+        def __exit__(self, exc_type, exc, tb):
+            self.port.timeout = self.timeout_saved
+
+    def crc16(self, addr: int, size: int) -> int:
+        self._write_fmt('<3I', self.CMD_CRC16, addr, size)
+        with self.PortTimeout(self.port, 10):
+            return self._read32()
+
+    def crc16_self(self) -> int:
+        return self.crc16(0, 0xffffffff)
+
+    def mmio_drain(self, fifo_addr: int, dst: int, count: int,
+                   stat_addr: int = 0, ready_mask: int = 0,
+                   spin_limit: int = 100000, timeout: int = 30):
+        """Pop `count` 32-bit words from `fifo_addr` into `dst`, on-target.
+
+        Each word is gated on (*stat_addr & ready_mask) when ready_mask != 0.
+        Returns (done, status); status 0 = ok, 1 = timed out waiting for ready.
+
+        Doing this from the host costs ~9200 round trips per page and caps page
+        reads at ~2.4 KB/s. Here a page is one mmio_drain plus one bulk read.
+
+        The target reads the FIFO exactly `count` times, never speculatively --
+        a read pops it, so a probe would shift every word after it. Accesses are
+        32-bit: the NAND window is Strongly-ordered with the MPU on and a
+        narrower access data-aborts.
+        """
+        self._write32(self.CMD_MMIO_DRAIN)
+        self._write_fmt('<6I', fifo_addr, stat_addr, ready_mask, count, dst,
+                        spin_limit)
+        with self.PortTimeout(self.port, timeout):
+            done = self._read32()
+            status = self._read32()
+        return done, status
+
+    def nand_read_pages(self, dst, row, npages, page_bytes=18432, ce=1, dev=0,
+                        col=0, nfif=0x1700E000, spin=200000, timeout=120):
+        """Read whole NAND pages into target memory, setup included, on-device.
+
+        Setup is ~30 register accesses per page (ImSetup, arm, status poll,
+        ImSetup, arm). As host round trips that dominates a dump, so the whole
+        per-page sequence runs on the target and the host issues one command
+        plus one bulk read per N pages.
+
+        Call mpu_setup_cpu0() first. Without the MPU the NFIF window is not
+        Device-typed, halfword stores get widened, and arming +0x20 wipes the
+        command byte at +0x22. Park the sequencer (Nfif.seq_stop()) as well --
+        it shares the flash pins with the indirect engine.
+
+        Returns (pages_done, bytes, status_last, err) where err is
+        0 ok / 1 arm timeout / 2 status timeout / 3 FIFO timeout.
+        """
+        self._write32(self.CMD_NAND_READ_PAGES)
+        self._write_fmt("<9I", nfif, dst, row, npages, page_bytes, ce, dev, col,
+                        spin)
+        with self.PortTimeout(self.port, timeout):
+            raw = self.port.read(32)
+        if len(raw) != 32:
+            raise IOError(f"nand_read_pages: short reply ({len(raw)} B)")
+        # pages, bytes, status_last, err, status_tries, fifo_spins, cycles, pad
+        return struct.unpack("<8I", raw)
+
+
+    # Ping-pong: run the drain on another core so it overlaps the transfer.
+    # Pack the job with nand_job_bytes(), write it as one mem_access block,
+    # start it, pull the previous batch over the wire, then wait. Use cpu 1;
+    # cpu3 is not running core_n_server and probing it wedges the shell.
+    NAND_JOB_FMT = "<9I"
+
+    @staticmethod
+    def nand_job_bytes(dst, row, npages, page_bytes=18432, ce=1, dev=0, col=0,
+                       nfif=0x1700E000, spin=200000):
+        """The request half of NandJob, for one blocking write."""
+        return struct.pack(Client.NAND_JOB_FMT, nfif, dst, row, npages,
+                           page_bytes, ce, dev, col, spin)
+
+    def nand_start(self, job, desc, cpu=1, timeout=30):
+        """Trigger a job on `cpu` and return at once -- does NOT wait."""
+        self._write32(self.CMD_NAND_START)
+        self._write_fmt("<3I", cpu, job, desc)
+        with self.PortTimeout(self.port, timeout):
+            raw = self.port.read(4)
+        if len(raw) != 4:
+            raise IOError("nand_start: no reply")
+        return struct.unpack("<I", raw)[0]
+
+    def nand_wait(self, job, cpu=1, spin=0, timeout=120):
+        """Block until the job publishes `done`, then report its counters.
+
+        Returns (pages, bytes, status_last, err, status_tries, fifo_spins,
+        timed_out, pad).
+        """
+        self._write32(self.CMD_NAND_WAIT)
+        self._write_fmt("<3I", cpu, job, spin)
+        with self.PortTimeout(self.port, timeout):
+            raw = self.port.read(32)
+        if len(raw) != 32:
+            raise IOError(f"nand_wait: short reply ({len(raw)} B)")
+        return struct.unpack("<8I", raw)
+
+    def nand_stream(self, row, npages, page_bytes=18432, ce_mask=0x040, dev=0,
+                    col=0, nfif=0x1700E000, spin=200000, timeout=120, burst=1):
+        """Stream NAND pages straight off the wire; the reply is the data.
+
+        The staged path copies every payload word across the bus several times
+        (FIFO -> DRAM -> tx payload -> ring). Here the drain writes into the
+        MAC's frame buffers directly, so a word costs one FIFO read and one ring
+        write, with no destination buffer and no second bulk read.
+
+        ce_mask selects the channels. Pages come back round-interleaved, one per
+        channel per row, ascending. Use a single channel: interleaving measured
+        98.4 pages/s on one, 18.3 on two, 4.6 on four, because switching channel
+        costs more than the tR it hides. Only dev0 is populated and ch0 is dead.
+        """
+        # On a short reply, resume from the first gap rather than re-running the
+        # batch; keep the contiguous prefix and re-read from the gap on.
+        nce = bin(ce_mask).count("1")
+        want = npages * nce * page_bytes
+        out = bytearray()
+        base = row
+        left = npages
+        early = hasattr(self.port, "give_up_early")
+        for _ in range(8):
+            if early:
+                self.port.give_up_early(True)
+            self._write32(self.CMD_NAND_STREAM)
+            self._write_fmt("<9I", nfif, base, left, page_bytes, ce_mask, dev,
+                            col, spin, burst)
+            with self.PortTimeout(self.port, timeout):
+                data = self.port.read(left * nce * page_bytes)
+            if not early:
+                return bytes(data)
+            # Round down to a whole ROUND (one page per CE), so a resume still
+            # starts on a row boundary for every chip.
+            rnd = page_bytes * nce
+            good = (len(data) // rnd) * rnd
+            out += data[:good]
+            if len(out) >= want:
+                break
+            base = row + len(out) // rnd
+            left = npages - len(out) // rnd
+            if left <= 0:
+                break
+        if early:
+            self.port.give_up_early(False)
+        return bytes(out[:want])
+
+    def mem_fill(self, dst: int=0, buf: bytes=b'', **kwargs):
+        size = len(buf)
+        count = kwargs.get('count', 0 if size == 0 else 1)
+        self._write32(self.CMD_MEM_FILL)
+        self._write_fmt('<3I', dst, size, count)
+        self.port.write(buf)
+        # can take a while
+        with self.PortTimeout(self.port, 10):
+            ack = self._read32()
+            if ack != 1:
+                raise Exception(f"mem_fill: bad ack {ack}")
 
     def bcm_wait_boot(self):
         saw_early_boot = False
@@ -472,8 +849,7 @@ class Client:
             dst0 = dst
             dst1 = dst + 0x100
         rv = self.bcm_cmd(2, dst0, dst1)
-        if dst != 0:
-            return self.read_str(dst0), self.read_str(dst1)
+        #if dst != 0: return self.read_str(dst0), self.read_str(dst1)
         return rv
 
     def bcm_get_system_state(self):
@@ -487,8 +863,8 @@ class Client:
     def bcm_aes_zeroize(self):
         return self.bcm_cmd(13)
 
-    def bcm_aes_process(self, src, dst, size, flag):
-        return self.bcm_cmd(14, src, dst, size, flag)
+    def bcm_aes_process(self, src, dst, size, flag, flag2):
+        return self.bcm_cmd(14, src, dst, size, flag, 0, 0, 0, 0, flag2)
 
     def bcm_aes_load_iv(self, iv):
         return self.bcm_cmd(15, iv)
@@ -1078,8 +1454,10 @@ class Client:
         # just puts some fuse vals in status regs
         # fucky because efc says "BCM eFuse key read fail" if it fails. maybe populates some engine's key?
         rv = self.bcm_cmd(315)
-        self.bcm_dump_regs()
-        return rv
+        flag1 = self.bcm_read_status(1) & 3
+        flag2 = self.bcm_read_status(2) & 1
+        flag3 = self.bcm_read_status(3)
+        return flag1, flag2, flag3
 
     def bcm_bignum_write(self, addr, val: int, num_dwords):
         self.write(addr, val.to_bytes(num_dwords * 4, 'little'))
@@ -1167,47 +1545,107 @@ class Client:
         for i in trange(0x900000, 0x910000, chunk_len, desc='stcm'):
             self.write(i, make_buf(i, chunk_len))
 
-    def dump_mem(self, tag):
+    def dump_mem(self, tag: str, **kwargs):
         is_eap = self.is_eap()
         cpu_name = 'eap' if is_eap else 'efc'
         chunk_len = 0x1000
-        '''
-        name = f'sram.{cpu_name}.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(self.SRAM_BASE, self.SRAM_END, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
-        #'''
+
+        dump_sram = kwargs.get('sram', False)
+        dump_spm = kwargs.get('spm', False)
+        dump_atcm = kwargs.get('atcm', False)
+        dump_btcm = kwargs.get('btcm', False)
+        dump_tcm_cpu = kwargs.get('tcm_cpu', None)
+        dump_stcm = kwargs.get('stcm', False)
+
+        def dump_one(name: str, start: int, size: int):
+            with dump_path(name).open('wb') as f:
+                for i in trange(start, start + size, chunk_len, desc=name):
+                    f.write(self.read(i, chunk_len))
+
+        if dump_sram:
+            dump_one(f'{tag}.sram.{cpu_name}', self.SRAM_BASE, self.SRAM_SIZE)
+
         if is_eap:
             return
-        '''
-        name = f'mem_1b000000.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(0x1b000000, 0x1b020000, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
-        name = f'mem_1b100000.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(0x1b100000, 0x1b223000, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
+
+        if dump_spm:
+            '''
+            0x18305000 0x1000 sig0
+            0x18307000 0x1000 sig1
+            0x18308000 0x3000 spm
+            '''
+            dump_one(f'{tag}.18305000', 0x18305000, 0x6000)
+
+        ''' ??
+        dump_one(f'{tag}.1b000000', 0x1b000000, 0x20000)
+        dump_one(f'{tag}.1b100000', 0x1b100000, 0x123000)
         #'''
-        name = f'mem_18305000.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(0x18305000, 0x1830b000, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
 
-        name = f'atcm.cpu0.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(0, 0x18000, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
+        for cpu_id in range(4):
+            if dump_tcm_cpu is not None and dump_tcm_cpu != cpu_id:
+                continue
 
-        name = f'btcm.cpu0.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(0x800000, 0x810000, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
+            atcm_base = 0x8000000 + cpu_id * 0x2000000
+            # check should vary based on cpu access comes from
+            if cpu_id == 0:
+                atcm_base = 0
+            btcm_base = atcm_base + 0x800000
+            atcm_size = 0x18000
+            if cpu_id == 2: atcm_size += 0x6000
+            if cpu_id == 3: atcm_size -= 0x6000
+            btcm_size = 0x10000
 
-        name = f'stcm.{tag}'
-        with dump_path(name).open('wb') as f:
-            for i in trange(0x900000, 0x910000, chunk_len, desc=name):
-                f.write(self.read(i, chunk_len))
+            if dump_atcm:
+                dump_one(f'{tag}.cpu{cpu_id}.atcm', atcm_base, atcm_size)
+            if dump_btcm:
+                dump_one(f'{tag}.cpu{cpu_id}.btcm', btcm_base, btcm_size)
+
+        if dump_stcm:
+            dump_one(f'{tag}.stcm', 0x900000, 0x10000)
+
+    def ipc_desc_regs(self, src_cpu: int, dst_cpu: int) -> int:
+        # titania has IpcFifo hw @ 14000000 which is new compared to eldora, but this seems to be rom/rom-handoff only
+        # normal efc fw still uses Ipc hw @ 10114000
+        # the ipc irq comes through vic (as in eldora)
+
+        # each desc is 8bytes IpcPacket_t
+        ipcDescOffset = [
+            [0, 0, 2, 4],
+            [6, 6, 8, 0xA],
+            [0xC, 0xE, 0xE, 0x10],
+            [0x12, 0x14, 0x16, 0x16]
+        ]
+        return 0x10114000 + 0x100 + 8 * ipcDescOffset[src_cpu][dst_cpu]
+
+    def ipc_write_cmd(self, src_cpu: int, dst_cpu: int, cmd: int, wParam: int, lParam: int):
+        desc_addr = self.ipc_desc_regs(src_cpu, dst_cpu)
+        self.write32(desc_addr + 4, lParam)
+        self.write32(desc_addr + 0, wParam << 16 | cmd << 2 | src_cpu)
+
+    def ipc_jump(self, dst_cpu: int, addr: int):
+        # XXX HalIpc_JumpToAddress uses some state in stcm and rIpc.INT_PEND_CLR before sending the cmd
+        # it seems only for overriding timed-out funcs tho?
+        #for i in range(4): print(f'{i} {self.read_regs32_str(0x9060A0+0x10*i, 4)}')
+        self.ipc_write_cmd(0, dst_cpu, 0x10, 0, addr)
+
+    def ipcfifo_get_regs(self, src_cpu: int, dst_cpu: int) -> int:
+        # cpu0 uses this for initial JumpToAddress only.
+        ipcfifo_reg_map_boot = [
+            [0, 1, 3, 5],
+            [0, 0, 7, 9],
+            [2, 6, 0, 0xB],
+            [4, 8, 0xA, 0],
+        ]
+        idx_boot = ipcfifo_reg_map_boot[dst_cpu][0]
+        # cpu0 uses this for all other IpcFifo calls, but none of them actually have callers.
+        ipcfifo_reg_map_fw = [
+            [0, 1, 3, 0],
+            [0, 7, 2, 6],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ]
+        idx_fw = ipcfifo_reg_map_fw[dst_cpu][0]
+        return 0x14000000 + 0x1000 * idx_boot
 
     def test_rom_ctrl(self, cpu_index):
         APB_BASE = 0x10115000
@@ -1257,9 +1695,26 @@ class Client:
 def read_regs(addr, size):
     return b''.join([x.to_bytes(4, 'little') for x in c.read_regs32(addr, size//4)])
 
-#'''
-c = Client('COM5')
+if __name__ == '__main__':
+    from tool import Ps5UartEnum, Ucmd
+    ROM_BAUD = 230400*2
+    EFC_FW_BAUD = 230400*2
+    EAP_FW_BAUD = 230400*3
+    gpio_is_eap = Ucmd().fc_cpu_get()
+    gpio_is_rom = Ucmd().fc_bootmode_get()
+    if gpio_is_rom:
+        port = Ps5UartEnum.titania_rom_port()
+        baudrate = ROM_BAUD
+    else:
+        port = Ps5UartEnum.titania_fw_port()
+        baudrate = EAP_FW_BAUD if gpio_is_eap else EFC_FW_BAUD
+    #Ucmd().load_eap()
+    c = Client(port, baudrate)
+    assert c.ping()
+    print(f"connected to {'eap' if gpio_is_eap else 'efc'} {'rom' if gpio_is_rom else 'fw'}")
 
+
+'''
 hexdump(read_regs(0x10115000, 0x1000), offset=0x10115000)
 exit()
 
@@ -1367,41 +1822,3 @@ ffffe000 ffffffff
 '''
 
 #c.exploit(0x1404)
-#c.bcm_zmodp_selftest()
-#for i in (0x4, 0x1c, 0x5c, 0x74, 0x78, 0x7c, 0x80): c.write32(0x10115400 + i, 0)
-'''
-for addr, val in c.read_array_fmt(0x10112000, '<I', 0x108):
-    print(f'{addr:8x} {val:8x}')
-bcm_regs_orig = c.read_array_fmt(c.BCM_BASE + 0x80, '<I', 0xe0 - 0x80)
-bcm_regs_orig_str = ' '.join(map(lambda x: f'{x:x}', [b for a, b in bcm_regs_orig]))
-for reg in range(0x10112000, 0x10112108, 4):
-    reg_orig = c.read32(reg)
-    for bitpos in range(32):
-        if reg == 0x10115050: continue # MC
-        if reg == 0x10115090 and bitpos == 31: continue # fw warm reset
-        if reg == 0x10115094 and bitpos == 0: continue # ? some other reset
-        if reg == 0x10115110: continue # uart control
-        if reg == 0x10115290 and bitpos == 31: continue # ??
-        if reg in (0x1011540c, 0x10115410, 0x10115420, 0x10115428, 0x10115430, 0x10115450, 0x10115458): continue
-        print(f'{reg:8x} {bitpos}')
-        c.write32(reg, reg_orig ^ (1 << bitpos))
-        for i in range(200):
-            if c.bcm_fifo_status != 0x300:
-                print('changed')
-                exit()
-        c.write32(reg, reg_orig)
-        for i in range(200):
-            if c.bcm_fifo_status != 0x300:
-                print('changed')
-                exit()
-        bcm_regs = c.read_array_fmt(c.BCM_BASE + 0x80, '<I', 0xe0 - 0x80)
-        diff = False
-        for (a, b), (c, d) in zip(bcm_regs_orig, bcm_regs):
-            if b != d:
-                diff = True
-                break
-        if diff:
-            bcm_regs_str = ' '.join(map(lambda x: f'{x:x}', [b for a, b in bcm_regs]))
-            print(f'{reg:8x} {bitpos:2d} {bcm_regs_orig_str} {bcm_regs_str}')
-            exit()
-'''

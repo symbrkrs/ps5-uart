@@ -1,0 +1,67 @@
+# nandgui -- the Titania NAND viewer
+#
+# Run it with:
+#     py -3 path/to/nandgui/main.py
+#
+# Verify a build without a GUI session (hidden window, real frames):
+#     py -3 path/to/nandgui/main.py --self-test 60
+#
+# ---------------------------------------------------------------------------
+# Python packages
+# ---------------------------------------------------------------------------
+# The version after each comment is what this was developed and verified
+# against; the pin is the floor, not that exact build.
+numpy>=2.0            # 2.4.2  -- summary arrays, colorize, histograms
+imgui-bundle>=1.92    # 1.92.900 -- imgui, hello_imgui runner, python glfw backend
+glfw>=2.7             # 2.10.2 -- window/context; also used by --self-test
+PyOpenGL>=3.1         # 3.1.10 -- gltex.py only; nothing else imports OpenGL
+
+# ---------------------------------------------------------------------------
+# Not on PyPI
+# ---------------------------------------------------------------------------
+# `titania` -- the dump/FTL/codec package this viewer reads through.  Install it
+# from its own checkout (`pip install -e .`), or set $TITANIA_PKG to the
+# directory that CONTAINS the package if it is not installed -- which is the
+# case when it is served over a network or VM share.
+#
+# nandgui/__init__.py::ensure_titania_on_path() is the ONLY place that resolves
+# it, and model.py is the only module that imports titania.*.  The import is
+# lazy and happens on a worker thread, so if titania is unreachable the app
+# still starts: the map, the legend and the summary all work, and the status bar
+# says the stores could not be opened.
+#
+# ---------------------------------------------------------------------------
+# Data (not code)
+# ---------------------------------------------------------------------------
+# Found under $TITANIA_NAND_DIR, else the working directory.  Individual paths
+# override with --raw / --decoded / --summary, or $TITANIA_RAW_STORE and
+# $TITANIA_DECODED_STORE.
+#
+#   <dir>/raw.store         raw pages,     page_bytes 18432
+#   <dir>/decoded.store     decoded pages, page_bytes 16416
+#   <dir>/summary.npz       the 48000-row per-block summary the map renders
+#                           from, built by `py -m titania.summary`.  OPTIONAL:
+#                           without it the app still starts, says what is
+#                           missing where the map would be, and the block stripe
+#                           and page inspector keep working because they read
+#                           the stores directly.  REBUILD IT WHENEVER A STORE IS
+#                           REBUILT -- it is a cache, and the map carries no
+#                           label saying its numbers are old.
+#   <dir>/cellmap.json      SLC/TLC per block (fallback geometry)
+#   <dir>/weru_table.json   WERU table
+#
+# A store is found by name first and then BY SHAPE -- page_bytes 18432 is raw,
+# 16416 is decoded -- so the file names above are a convention, not a
+# requirement.  When more than one store of a shape is present the viewer prints
+# which it opened and what else was there rather than choosing silently.
+#
+# NEVER open the stores while anything is writing them: the index is mmapped.
+#
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+# The GUI needs an interactive desktop session.  hello_imgui enumerates
+# monitors at startup and exits with "could not use non existent monitor #0!"
+# when it is launched from a session that has none (a service account, some
+# detached ssh/agent shells).  --self-test does not go through that runner, so
+# it stays usable in those environments.

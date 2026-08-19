@@ -1,0 +1,144 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "titania"
+version = "0.1.0"
+description = "Read, decode and verify PS5 Titania (Marvell 88SS1098/9) NAND"
+# The package README, not the repository one: this file describes titania,
+# and the root README covers the board tooling as well.
+readme = "titania/README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "ps5-uart" }]
+keywords = ["ps5", "titania", "nand", "ldpc", "ftl", "forensics"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Recovery Tools",
+]
+
+# numpy is not optional: the LDPC layer is dense GF(2) linear algebra over
+# 2400x8218 matrices and the pure-Python fallback does not exist.
+# pycryptodome is not optional either: the group 2 firmware images are
+# AES-encrypted and `titania fw` cannot report on them without it.
+dependencies = [
+    "numpy>=1.21",
+    "pycryptodome>=3.15",
+]
+
+[project.optional-dependencies]
+# The viewer.  Separate from the library because nothing offline needs a GL
+# context, and because a headless install (CI, a build box, a forensics VM)
+# should not be made to pull imgui and PyOpenGL to read a store.  The floors are
+# `nandgui/requirements.txt`'s, which records what each was verified against;
+# note numpy is pinned HIGHER here than the library's own >=1.21 -- the viewer's
+# summary arrays and colorize path were developed against 2.x.
+gui = [
+    "numpy>=2.0",
+    "imgui-bundle>=1.92",
+    "glfw>=2.7",
+    "PyOpenGL>=3.1",
+]
+# The live board.  Everything under `titania.hwdev` -- the UART bridge to the
+# Pico, the NAND drivers, the progress bars.  Nothing offline needs any of it,
+# and `titania.hwdev` degrades to a DeviceError naming the missing module.
+hardware = [
+    "pyserial>=3.5",
+    "xmodem>=0.4",
+    "tqdm>=4.60",
+    "hexdump2>=1.0",
+]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+titania = "titania.cli:main"
+# Same entry point as `python -m nandgui`; both go through nandgui.app.main,
+# which takes argv and returns an exit code.
+nandgui = "nandgui.app:main"
+
+[project.urls]
+# The package is `titania`; it lives in the ps5-uart repository, which is also
+# where the board-side payloads and the UART tooling it grew out of live.
+Homepage = "https://github.com/symbrkrs/ps5-uart"
+Repository = "https://github.com/symbrkrs/ps5-uart"
+Issues = "https://github.com/symbrkrs/ps5-uart/issues"
+
+# ---------------------------------------------------------------------------
+# HOW THE CODEC FINDS ITS EIGHT MEASURED TABLES, IN A CHECKOUT AND IN A WHEEL
+# ---------------------------------------------------------------------------
+# The codec chain USED TO BE ~39 modules at the repository root -- titania_nand
+# and the nd_/fa_/fb_/fc_/fd_ solvers it imports -- mapped in here one by one as
+# top-level `py-modules`.  That was the source of two problems.  A wheel has
+# nowhere to put a data file next to a TOP-LEVEL module, so `pip install .`
+# installed the code without the tables and died on a missing table at
+# import; and thirty-nine generic names like `fa_ring` and `nd_elim` went onto
+# the global import path of anyone who installed us.
+#
+# They now live INSIDE the package, as `titania.nd_ldpc`, `titania.fa_ring` and
+# so on, so this list is down to the one root module that is genuinely still a
+# root module -- and the tables went with them, into `titania/data/`.
+#
+# `nd_tables.table()` resolves that relative to `__file__`, which is the same
+# directory in a checkout, under `pip install -e .` and in an unpacked wheel:
+# one location, one code path, both installs.  It used to search the checkout
+# root first and the package data second, from back when the codec chain WAS at
+# the checkout root; the second copy outlived its reason and has been removed.
+#
+# `tests/test_packaging.py` checks every table against the digest recorded in
+# `nd_tables.SHA256` when it was read off the silicon.  That is the check worth
+# keeping: the retired byte-identical-copies test could not catch two copies
+# damaged the SAME way -- which is exactly what a careless sweep over `*.bin`
+# produces, and it happened -- while a digest catches it with one copy.
+[tool.setuptools]
+# `nandgui` ships alongside the library rather than as a separate distribution:
+# it is not independently useful -- every page it draws comes through
+# `titania.dumpdev` -- and versioning the two apart would let a viewer read a
+# store format its own library no longer writes.  It carries no package data;
+# its three sidecars are DERIVED and rebuilt at runtime (`nandgui.sidecar`).
+packages = ["titania", "nandgui"]
+# No py-modules. Nothing at the repository root is installed: `tool.py`,
+# `uart_client.py`, `titania_gbe.py` and `titania_fw.py` are the host side of
+# the UART/GbE link, their names are far too generic to put on a global import
+# path, and the modules that reach them (`titania.hwdev`, `titania.gbedev`) put
+# the checkout on sys.path themselves before importing. `titania_fw` was listed
+# here until it was noticed that its only importer is `uart_client.py`, which is
+# not installed either -- so the wheel carried a module nothing in it could use.
+#
+# The consequence, stated plainly: driving real hardware is a CHECKOUT-only
+# operation. An installed titania reads captures.
+
+# The measured tables -- ECU config images, read out of the controller --
+# shipped inside the package so a plain wheel carries them.  Enumerated rather
+# than globbed: `titania/data/*` would quietly pick up anything a future run
+# dropped in there, and what is and is not measurement has to stay an explicit
+# list.  It is the same list as `nd_tables.TABLES`, and the test suite checks
+# the two agree and that `titania/data/` holds nothing else.
+[tool.setuptools.package-data]
+titania = [
+    "data/ek_ee3_dec.bin",
+    "data/ek_ee3_enc.bin",
+    "data/nd_ecutbl_ecc0dec_code0_rdsel0_bank15.bin",
+    "data/nd_ecutbl_ecc0enc_code0_rdsel0_bank3.bin",
+    "data/nd_g2ldpc_a10r_base.json",
+    "data/ne_ldpc_dec_b11_rd0_n8192.bin",
+    # The device-side reduction stubs, compiled on demand by `armbuild` and
+    # uploaded to the EFC. Source rather than measurement, but they follow the
+    # tables into the package for the same reason: resolved from `__file__`,
+    # they work identically in a checkout and in a wheel, and an install without
+    # them cannot capture from hardware at all.
+    "stubs/nd_scan.c",
+    "stubs/nd_drain.c",
+    "stubs/tdev_scan.c",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The tests must run with no dump, no board and no store.  Anything that needs
+# real media belongs in a module's own `--selftest`, not here.
+addopts = "-q"
+markers = [
+    "needs_tables: needs the codec data tables next to the root modules",
+]

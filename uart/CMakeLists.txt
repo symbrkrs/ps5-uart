@@ -37,6 +37,8 @@ target_include_directories(uart PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/config
     )
 
+pico_generate_pio_header(uart ${CMAKE_CURRENT_LIST_DIR}/pio_uart.pio)
+
 target_sources(uart PRIVATE
     ps5_uart.cpp
     )
@@ -56,6 +58,7 @@ target_compile_options(uart PRIVATE
 target_link_libraries(uart PRIVATE
     pico_runtime
     tinyusb_device
+    hardware_pio
     )
 
 pico_enable_stdio_uart(uart DISABLED)

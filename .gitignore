@@ -2,4 +2,54 @@ __pycache__/
 .vscode/
 bin/
 build/
+dumps/
 efc_logs/
+claude_crap/
+attic/
+kp_dump/
+kp_store/
+no_dump/
+pa_dump/
+.ftlcache/
+/rs/*/target/
+
+# Extracted firmware. None of this is ours to redistribute, and it is easy to
+# stage by accident because it sits at the top level with everything else.
+fw_0x*.bin
+fw_group_*.bin
+g2_fw*.bin
+dump_fw_*.bin
+*.sram.efc.bin
+ddr_*.bin
+eap_*.bin
+
+# Capture output and solver scratch.
+titania_nand*/
+*.store/
+kp_states*.txt
+*.pkl
+*.npz
+*.npy
+
+# Rust build output, and the experiment variants kept beside src/main.rs
+/rs/*/src/main.rs.*
+
+# Solver and analysis scratch. 14.2 MB of it accumulates at the top level during
+# a session -- run logs, dumped candidate tables, intermediate JSON -- and every
+# one of these sits beside the source rather than in a subdirectory, so a single
+# `git add -A` sweeps the lot into a public history. Named by extension at the
+# ROOT only (`/*.log`, not `*.log`) so a log file that is genuinely part of the
+# project further down the tree is still addable.
+/*.log
+/*.txt
+/*.json
+/*.bin
+/*.elf
+/*.out
+
+# Python build output.
+*.egg-info/
+/dist/
+
+# The board-side payloads build in place, beside their sources.
+/bin_blobs/build*/

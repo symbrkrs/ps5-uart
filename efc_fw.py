@@ -4,7 +4,7 @@ from pathlib import Path
 from serial import Serial
 from threading import Thread
 from queue import Queue
-from hexdump import hexump
+from hexdump2 import hexump
 import sys
 import struct
 

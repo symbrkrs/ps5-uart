@@ -66,3 +66,6 @@ add_bin_efc(efc_stcm_counter efc_stcm_counter.cpp)
 
 add_bin_efc(efc_uart_shell uart_shell.cpp uart_shell.ld)
 add_bin_eap(eap_uart_shell uart_shell.cpp uart_shell.ld)
+
+add_bin_efc(efc_uart_shell_rom uart_shell.cpp uart_shell_rom.ld)
+target_compile_definitions(efc_uart_shell_rom PRIVATE ROM_ENV)

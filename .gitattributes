@@ -1,0 +1,13 @@
+# Everything in this tree is LF. Parts of it get edited from Windows against a
+# WSL share, which silently rewrites whole files to CRLF and turns a one-line
+# change into a whole-file diff.
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.bin  binary
+*.elf  binary
+*.npz  binary
+*.npy  binary
+*.pkl  binary
+*.pdf  binary

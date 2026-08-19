@@ -5,7 +5,7 @@ import code
 import struct
 from tqdm import trange
 from serial import Serial
-from hexdump import hexdump
+from hexdump2 import hexdump
 import sys
 from pathlib import Path
 
@@ -31,6 +31,45 @@ def xor_buf(a, b):
 
 def or_buf(a, b):
     return bytes([x | y for x, y in zip(a, b)])
+
+
+class Ps5UartEnum:
+    Debug = 0
+    Emc = 1
+    TitaniaFw = 2
+    TitaniaRom = 3
+
+    BaudrateEfc = 230400*2
+    BaudrateEap = 230400*3
+
+    @staticmethod
+    def get_port(port_type: int) -> str:
+        import serial.tools.list_ports
+        ports = list(filter(lambda port: port.vid == 0x2e8a and port.pid == 0x5000, serial.tools.list_ports.comports()))
+        has_debug = len(ports) == 4
+        def map_location(location: str | None) -> int:
+            index = 0 if location is None else int(location.split('.')[-1])
+            index //= 2
+            if not has_debug: index += 1
+            return index
+        devices = {map_location(port.location): port.device for port in ports}
+        return devices.get(port_type)
+
+    @staticmethod
+    def debug_port() -> str:
+        return Ps5UartEnum.get_port(Ps5UartEnum.Debug)
+
+    @staticmethod
+    def emc_port() -> str:
+        return Ps5UartEnum.get_port(Ps5UartEnum.Emc)
+
+    @staticmethod
+    def titania_fw_port() -> str:
+        return Ps5UartEnum.get_port(Ps5UartEnum.TitaniaFw)
+
+    @staticmethod
+    def titania_rom_port() -> str:
+        return Ps5UartEnum.get_port(Ps5UartEnum.TitaniaRom)
 
 """
 weird crash/hang:
@@ -154,7 +193,7 @@ class PicoFrame:
 
 class Ucmd:
     def __init__(self):
-        self.port = Serial("COM5", timeout=0.5)
+        self.port = Serial(Ps5UartEnum.emc_port(), timeout=0.5)
         self.rom_buf = b''
 
     def wait_frame(self, accept_types, **kwargs) -> list[PicoFrame]:
@@ -173,7 +212,8 @@ class Ucmd:
                 frames.append(frame)
                 if frame.rtype in accept_types and (response is None or response == frame.response):
                     break
-        except:
+        except struct.error as e:
+            # fail to parse -> timeout
             print("\t\ttimeout")
             pass
         if timeout is not None:
@@ -316,6 +356,11 @@ class Ucmd:
     def unlock(self):
         return self.cmd_send_recv("unlock", timeout=2)
 
+    def emc_uart_bug_is_patched(self):
+        version = self.cmd_send_recv('version')
+        # TODO check if version >= "E1E 0001 0008 0003 1B9B" (fw 5.10)
+        # last known vulnerable version is "E1E 0001 0008 0002 1B03" (fw 5.02)
+
     def screset(self, val=0):
         # arg gets poked into WDT. if arg is "sc" or "subsys", pokes 0
         return self.cmd_send_recv(f"screset {val}", timeout=5)
@@ -330,10 +375,11 @@ class Ucmd:
         val = ("clr", "set")[val]
         return self.cmd_send_recv(f"port {val} {group} {num}")
 
-    def gpio_get(self, group: str, num: int):
+    def gpio_get(self, group: str, num: int) -> int:
         group = group.lower()
         assert group in ("a", "c", "d")
-        return self.cmd_send_recv(f"port get {group} {num}")
+        rv = self.cmd_send_recv(f"port get {group} {num}")
+        return int(rv[-1].response, 16)
 
     def pg2_fc_rails_set(self, enable: bool):
         return self.gpio_set("a", 16, 1 if enable else 0)
@@ -343,9 +389,15 @@ class Ucmd:
 
     def fc_bootmode_set(self, uart: bool):
         return self.gpio_set("a", 30, 1 if uart else 0)
+    
+    def fc_bootmode_get(self) -> int:
+        return self.gpio_get("a", 30)
 
     def fc_cpu_set(self, eap: bool):
         return self.gpio_set("a", 31, 1 if eap else 0)
+    
+    def fc_cpu_get(self) -> int:
+        return self.gpio_get("a", 31)
 
     def install_custom_cmd(self):
         code = load_bin("emc_cmd_handler")
@@ -387,7 +439,7 @@ class Ucmd:
         self._custom_cmd(4, addr, *data)
 
     def ddr_write(self, addr: int, data: bytes):
-        for i in trange(0, len(data), 4 * 6):
+        for i in range(0, len(data), 4 * 6):
             self.ddr_write_18(addr + i, data[i : i + 4 * 6])
 
     def ddr_write_hook(self, addr: int, match: int, target: int):
@@ -636,9 +688,9 @@ class Ucmd:
     def load_fw(self, fw, to_dram, offset):
         return self.sccmd(1, fw, to_dram, offset)
 
-    def setup_bar(self, mode, size, init_val):
+    def setup_bar(self, mode, size, init_val, arg3=0):
         # mode 0: emc, 1: psp, 2: ?
-        return self.sccmd(2, mode, size, init_val)
+        return self.sccmd(2, mode, size, init_val, arg3)
 
     def _open_close_nand_access(self, op):
         self.sccmd(5, op)
@@ -770,6 +822,9 @@ class Ucmd:
         # ignore wdt_start request from eap_kbl
         self.emc_write(0x123FCA, bytes.fromhex("00bf00bf"))
 
+        self.eap_off()
+        self.pg2_off()
+
         self.pg2_on()
         self.efc_on()
 
@@ -835,6 +890,7 @@ class Ucmd:
         sc = load_bin('emc_shellcode')
         return self.pico_fw_const('E1E 0001 0008 0002 1B03', buf_addr, sc)
 
+
     def try_unlock(self):
         while True:
             frames = self.unlock()
@@ -898,8 +954,8 @@ def efc_test():
     code.InteractiveConsole(locals=dict(globals(), **locals())).interact("Entering shell...")
 
 
-def test_efc_on():
-    emc = Ucmd()
+def test_efc_on(emc: Ucmd):
+    #emc = Ucmd()
     emc.screset()
     emc.unlock()
     emc.install_custom_cmd()
@@ -935,7 +991,7 @@ def test_efc_on():
     # 201d: 5F007404 |= 0x1000, 5F007414 |= 0x40. both are needed
     # 2089: inits titania spi ports
     fc_on_efc_seq = [
-        0x201D,
+        #0x201D,
         # 0x2027,0x2110,0x2033,
         0x2089,
         # 0x2035
@@ -957,8 +1013,8 @@ def test_efc_on():
     for seq in fc_on_efc_seq:
         emc.runseq(seq)
     # some clocks? both pause/resume efc at will
-    # emc.emc_or32(0x5F007404, 0x1000)
-    # emc.emc_or32(0x5F007414, 0x40)
+    emc.emc_or32(0x5F007404, 0x1000) # i guess it's pcie clk (100M)?
+    emc.emc_or32(0x5F007414, 0x40) # FC_SYSCLK(25Mhz). very noisy, tons of clocks on titania wake up.
     emc.fc_reset_set(False)
 
 

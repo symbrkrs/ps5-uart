@@ -10,9 +10,13 @@
 #include <vector>
 
 #include <hardware/gpio.h>
+#include <hardware/pio.h>
+#include <hardware/structs/sio.h>
 #include <hardware/sync.h>
 #include <hardware/timer.h>
 #include <pico/bootrom.h>
+
+#include "pio_uart.pio.h"
 #ifdef ENABLE_DEBUG_STDIO
 #include <pico/stdio_usb.h>
 #endif
@@ -247,6 +251,7 @@ struct EmcResetGpio : ActiveLowGpio {
   bool is_reset() const { return sample() == false; }
 };
 
+
 struct UcmdClientEmc {
   bool init() {
     uart_rx_.setup_irq(&uart_);
@@ -267,7 +272,11 @@ struct UcmdClientEmc {
     return uart_rx_.read_line_timeout(line, timeout_us);
   }
 
-  static void rx_handler() { uart_rx_.uart_rx_handler(); }
+  static void rx_handler() {
+    uart_rx_.uart_->try_read([](u8 b) {
+      uart_rx_.push(b);
+    });
+  }
 
   void cdc_write(u8 itf, const std::vector<u8>& buf) {
     const auto len = buf.size();
@@ -969,7 +978,11 @@ struct Efc {
     }
     return true;
   }
-  static void rx_handler() { uart_rx_.uart_rx_handler(); }
+  static void rx_handler() {
+    uart_rx_.uart_->try_read([](u8 b) {
+      uart_rx_.push(b);
+    });
+  }
   void cdc_process(u8 itf, u32 max_time_us = 1'000) {
     cdc_line_coding_t coding{};
     tud_cdc_n_get_line_coding(itf, &coding);
@@ -1001,6 +1014,77 @@ struct Efc {
 };
 Buffer1k Efc::uart_rx_;
 
+struct PioUart {
+  static constexpr uint kTxPin = 10;
+  static constexpr uint kRxPin = 11;
+  static constexpr uint kDefaultBaud = 460800;
+
+  bool init() {
+    pio_ = pio0;
+    sm_tx_ = pio_claim_unused_sm(pio_, true);
+    sm_rx_ = pio_claim_unused_sm(pio_, true);
+    offset_tx_ = pio_add_program(pio_, &pio_uart_tx_program);
+    offset_rx_ = pio_add_program(pio_, &pio_uart_rx_program);
+    pio_uart_tx_program_init(pio_, sm_tx_, offset_tx_, kTxPin, kDefaultBaud);
+    pio_uart_rx_program_init(pio_, sm_rx_, offset_rx_, kRxPin, kDefaultBaud);
+    baudrate_ = kDefaultBaud;
+    return true;
+  }
+
+  void set_baudrate(uint baudrate) {
+    if (baudrate_ == baudrate || baudrate == 0) return;
+    float div = (float)clock_get_hz(clk_sys) / (baudrate * 8);
+    pio_sm_set_clkdiv(pio_, sm_tx_, div);
+    pio_sm_set_clkdiv(pio_, sm_rx_, div);
+    pio_sm_clkdiv_restart(pio_, sm_tx_);
+    pio_sm_clkdiv_restart(pio_, sm_rx_);
+    baudrate_ = baudrate;
+  }
+
+  void cdc_process(u8 itf, u32 max_time_us = 1'000) {
+    cdc_line_coding_t coding{};
+    tud_cdc_n_get_line_coding(itf, &coding);
+    set_baudrate(coding.bit_rate);
+
+    // RX: PIO -> USB
+    const u32 start = time_us_32();
+    do {
+      u32 write_avail = tud_cdc_n_write_available(itf);
+      if (!write_avail) break;
+      u32 count = 0;
+      u8 buf[64];
+      while (count < sizeof(buf) && count < write_avail &&
+             !pio_sm_is_rx_fifo_empty(pio_, sm_rx_)) {
+        buf[count++] = pio_sm_get(pio_, sm_rx_) >> 24;
+      }
+      if (!count) break;
+      u32 num_written = 0;
+      while (tud_cdc_n_connected(itf) && num_written < count) {
+        num_written += tud_cdc_n_write(itf, &buf[num_written], count - num_written);
+      }
+      if (!tud_cdc_n_connected(itf)) return;
+      tud_cdc_n_write_flush(itf);
+    } while (time_us_32() - start < max_time_us);
+  }
+
+  void write_from_usb(const u8* data, u32 len) {
+    for (u32 i = 0; i < len; i++) {
+      // Blocking put — wait for TX FIFO space
+      while (pio_sm_is_tx_fifo_full(pio_, sm_tx_)) {
+        tight_loop_contents();
+      }
+      pio_sm_put(pio_, sm_tx_, data[i]);
+    }
+  }
+
+  PIO pio_{};
+  uint sm_tx_{};
+  uint sm_rx_{};
+  uint offset_tx_{};
+  uint offset_rx_{};
+  uint baudrate_{};
+};
+
 static constexpr tusb_desc_device_t s_usbd_desc_device = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
@@ -1026,12 +1110,14 @@ static const std::u16string s_string_descs[]{
 
 enum {
   ITF_NUM_CDC_0 = 0,
-  ITF_NUM_CDC_0_DATA,  // this is copied from sdk. do we really need _DATA?
+  ITF_NUM_CDC_0_DATA,
   ITF_NUM_CDC_1,
   ITF_NUM_CDC_1_DATA,
-#ifdef ENABLE_DEBUG_STDIO
   ITF_NUM_CDC_2,
   ITF_NUM_CDC_2_DATA,
+#ifdef ENABLE_DEBUG_STDIO
+  ITF_NUM_CDC_3,
+  ITF_NUM_CDC_3_DATA,
 #endif
   ITF_NUM_TOTAL
 };
@@ -1045,9 +1131,11 @@ enum : u8 {
   EP_NUM_DATA_0,
   EP_NUM_NOTIF_1,
   EP_NUM_DATA_1,
-#ifdef ENABLE_DEBUG_STDIO
   EP_NUM_NOTIF_2,
   EP_NUM_DATA_2,
+#ifdef ENABLE_DEBUG_STDIO
+  EP_NUM_NOTIF_3,
+  EP_NUM_DATA_3,
 #endif
 };
 
@@ -1061,20 +1149,21 @@ enum : u8 {
 
 #ifdef ENABLE_DEBUG_STDIO
 // 0 is taken by pico_stdio_usb
-#define CDC_INTERFACE_START 1
+#define CDC_IF_START 1
 #else
-#define CDC_INTERFACE_START 0
+#define CDC_IF_START 0
 #endif
-#define CDC_INTERFACE_EMC CDC_INTERFACE_START
-// TODO support both EFC uarts (use pio for emc?)
-#define CDC_INTERFACE_EFC (CDC_INTERFACE_START + 1)
+#define CDC_IF_SALINA CDC_IF_START
+#define CDC_IF_TITANIA_0 (CDC_IF_START + 1)
+#define CDC_IF_TITANIA_1 (CDC_IF_START + 2)
 
 static constexpr u8 s_config_desc[USBD_DESC_LEN] = {
     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, USBD_DESC_LEN, 0, 100),
     CDC_DESCRIPTOR(0),
     CDC_DESCRIPTOR(1),
-#ifdef ENABLE_DEBUG_STDIO
     CDC_DESCRIPTOR(2),
+#ifdef ENABLE_DEBUG_STDIO
+    CDC_DESCRIPTOR(3),
 #endif
 };
 
@@ -1111,6 +1200,7 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
 
 static UcmdClientEmc s_emc;
 static Efc s_efc;
+static PioUart s_pio_uart;
 
 // tinyusb already double buffers: first into EP
 // buffer(size=CFG_TUD_CDC_EP_BUFSIZE), then a
@@ -1125,7 +1215,7 @@ void tud_cdc_rx_wanted_cb(u8 itf, char wanted_char) {
   // emc interface makes assumption that multiple cmds will not be in tinyusb rx
   // ringbuffer simultaneously. this sucks but should be fine in practice.
 
-  if (itf != CDC_INTERFACE_EMC) {
+  if (itf != CDC_IF_SALINA) {
     return;
   }
   // emc - line buffer
@@ -1137,9 +1227,17 @@ void tud_cdc_rx_wanted_cb(u8 itf, char wanted_char) {
   }
 }
 
-// efc - passthrough
+// efc/pio - passthrough
 void tud_cdc_rx_cb(u8 itf) {
-  if (itf != CDC_INTERFACE_EFC) {
+  if (itf == CDC_IF_TITANIA_1) {
+    const u32 avail = tud_cdc_n_available(itf);
+    std::vector<u8> buf(avail);
+    if (tud_cdc_n_read(itf, buf.data(), avail) == avail) {
+      s_pio_uart.write_from_usb(buf.data(), avail);
+    }
+    return;
+  }
+  if (itf != CDC_IF_TITANIA_0) {
     return;
   }
   const u32 avail = tud_cdc_n_available(itf);
@@ -1150,6 +1248,8 @@ void tud_cdc_rx_cb(u8 itf) {
 }
 
 int main() {
+  set_sys_clock_khz(280'000, true);
+
   if (!tusb_init()) {
     return 1;
   }
@@ -1166,9 +1266,12 @@ int main() {
   if (!s_efc.init()) {
     return 1;
   }
+  if (!s_pio_uart.init()) {
+    return 1;
+  }
 
   // setup for emc to use tud_cdc_rx_wanted_cb
-  tud_cdc_n_set_wanted_char(CDC_INTERFACE_EMC, '\n');
+  tud_cdc_n_set_wanted_char(CDC_IF_SALINA, '\n');
 
   while (true) {
     // let tinyusb process events
@@ -1176,8 +1279,9 @@ int main() {
     tud_task();
 
     // uart -> usb
-    s_emc.cdc_process(CDC_INTERFACE_EMC);
-    s_efc.cdc_process(CDC_INTERFACE_EFC);
+    s_emc.cdc_process(CDC_IF_SALINA);
+    s_efc.cdc_process(CDC_IF_TITANIA_0);
+    s_pio_uart.cdc_process(CDC_IF_TITANIA_1);
 
     if (get_bootsel_button()) {
       reset_usb_boot(0, 0);

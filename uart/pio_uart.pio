@@ -1,0 +1,85 @@
+;
+; PIO UART — TX and RX programs
+;
+; TX: Pull 8-bit words from FIFO, emit start bit + 8 data bits + stop bit.
+; RX: Wait for start bit, sample 8 data bits at midpoint, push to FIFO.
+;
+; Bit rate = clk_sys / (clkdiv * cycles_per_bit)
+; TX: 10 cycles per bit (1 out + 9 delay in the sideset/jmp loop — simplified below)
+; RX: 8 cycles per bit
+;
+
+; ──────────────── TX ────────────────
+; Autopull 8 bits. Each bit: OUT pins,1 then delay.
+; Start bit (low), 8 data bits (LSB first), stop bit (high).
+; Uses sideset for the pin so we can hold stop-bit level while stalling.
+
+.program pio_uart_tx
+.side_set 1 opt
+
+    pull       side 1 [7]  ; stall with line idle high, get 8 bits
+    set x, 7  side 0 [7]  ; start bit (low), set bit counter
+bitloop:
+    out pins, 1            ; shift out 1 data bit
+    jmp x-- bitloop  [6]  ; loop 8 times, 8 cycles per bit
+    ; stop bit is handled by the pull stall (side 1)
+
+; ──────────────── RX ────────────────
+; Wait for start bit (line goes low), then sample 8 bits at midpoint.
+
+.program pio_uart_rx
+
+.wrap_target
+    wait 0 pin 0           ; wait for start bit (line low)
+    set x, 7         [10]  ; bit counter = 8, delay to midpoint of bit 0
+bitloop:
+    in pins, 1             ; sample one data bit (autopush fires after 8th)
+    jmp x-- bitloop  [6]  ; loop 8 times, 8 cycles per bit
+.wrap                      ; wraps back during stop bit; autopush already pushed
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void pio_uart_tx_program_init(PIO pio, uint sm, uint offset,
+                                            uint pin, uint baudrate) {
+    pio_sm_config c = pio_uart_tx_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, true, false, 8);  // shift right (LSB first), no autopull
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    // Idle high (stop bit)
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+
+    // 8 PIO cycles per bit
+    float div = (float)clock_get_hz(clk_sys) / (baudrate * 8);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static inline void pio_uart_rx_program_init(PIO pio, uint sm, uint offset,
+                                            uint pin, uint baudrate) {
+    pio_sm_config c = pio_uart_rx_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    // Pull-up on RX pin (idle high)
+    gpio_pull_up(pin);
+
+    sm_config_set_in_shift(&c, true, true, 8);  // shift right, autopush at 8
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // 8 PIO cycles per bit
+    float div = (float)clock_get_hz(clk_sys) / (baudrate * 8);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
